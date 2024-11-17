@@ -1,0 +1,527 @@
+source account:
+# Source account resources
+resource "aws_cloudwatch_log_group" "source_log_group" {
+  provider = aws.source_account
+  name     = "/aws/kinesisfirehose/SourceLogGroup"
+  retention_in_days = 14
+}
+
+resource "aws_iam_role" "cloudwatch_to_kinesis_role" {
+  provider = aws.source_account
+  name     = "CloudWatchToKinesisRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.${var.region}.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "assume_centralized_role" {
+  provider = aws.source_account
+  name     = "AssumeCentralizedRole"
+  role     = aws_iam_role.cloudwatch_to_kinesis_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:PutSubscriptionFilter",
+          "logs:DescribeSubscriptionFilters",
+          "logs:DeleteSubscriptionFilter"
+        ]
+        Resource = aws_cloudwatch_log_group.source_log_group.arn
+      },
+      {
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = aws_iam_role.cloudwatch_to_kinesis_role.arn
+      }
+    ]
+  })
+}
+
+# Central account resources
+resource "aws_iam_role" "central_cloudwatch_role" {
+  provider = aws.central_account
+  name     = "central-cloudwatch-kinesis-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.${var.region}.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  lifecycle {
+    ignore_changes = [name]
+  }
+}
+
+import {
+  to = aws_iam_role.central_cloudwatch_role
+  id = "central-cloudwatch-kinesis-role"
+}
+
+data "aws_kinesis_stream" "centralized_log_stream" {
+  provider = aws.central_account
+  name     = "centralized-log-stream"
+}
+
+resource "aws_iam_role_policy" "central_cloudwatch_policy" {
+  provider = aws.central_account
+  name     = "central-cloudwatch-kinesis-policy"
+  role     = aws_iam_role.central_cloudwatch_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "kinesis:PutRecord",
+          "kinesis:PutRecordBatch",
+          "kinesis:DescribeStream",
+          "kinesis:DescribeStreamSummary",
+          "kinesis:GetShardIterator",
+          "kinesis:GetRecords",
+          "kinesis:ListShards"
+        ]
+        Resource = data.aws_kinesis_stream.centralized_log_stream.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${var.region}:${var.central_account_id}:log-group:*:log-stream:*"
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_destination" "kinesis_destination" {
+  provider     = aws.central_account
+  name         = "kinesis-destination"
+  role_arn     = aws_iam_role.central_cloudwatch_role.arn
+  target_arn   = data.aws_kinesis_stream.centralized_log_stream.arn
+
+  depends_on = [aws_iam_role_policy.central_cloudwatch_policy]
+}
+
+resource "aws_cloudwatch_log_destination_policy" "kinesis_destination_policy" {
+  provider         = aws.central_account
+  destination_name = aws_cloudwatch_log_destination.kinesis_destination.name
+  access_policy    = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          AWS = var.source_account_id
+        }
+        Action = "logs:PutSubscriptionFilter"
+        Resource = aws_cloudwatch_log_destination.kinesis_destination.arn
+      }
+    ]
+  })
+
+  depends_on = [aws_cloudwatch_log_destination.kinesis_destination]
+}
+
+# Data sources
+data "aws_caller_identity" "source" {
+  provider = aws.source_account
+}
+
+data "aws_caller_identity" "central" {
+  provider = aws.central_account
+}
+
+# Subscription filter in source account
+resource "aws_cloudwatch_log_subscription_filter" "kinesis_subscription" {
+  provider        = aws.source_account
+  name            = "kinesis-subscription"
+  log_group_name  = aws_cloudwatch_log_group.source_log_group.name
+  filter_pattern  = ""
+  destination_arn = aws_cloudwatch_log_destination.kinesis_destination.arn
+  role_arn        = aws_iam_role.cloudwatch_to_kinesis_role.arn
+
+  depends_on = [
+    aws_cloudwatch_log_destination_policy.kinesis_destination_policy,
+    aws_cloudwatch_log_group.source_log_group
+  ]
+}
+
+# Source account role for S3 access (if needed)
+resource "aws_iam_role" "source_account_role" {
+  provider = aws.source_account
+  name     = "source-account-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${var.central_account_id}:root"
+        }
+        Action = "sts:AssumeRole"
+        Condition = {
+          StringEquals = {
+            "sts:ExternalId": "KinesisAccess"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "source_account_policy" {
+  provider = aws.source_account
+  name     = "source-account-policy"
+  role     = aws_iam_role.source_account_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::testeks12-${var.unique_identifier}",
+          "arn:aws:s3:::testeks12-${var.unique_identifier}/*"
+        ]
+      }
+    ]
+  })
+}
+
+centralized account:
+resource "aws_cloudwatch_log_group" "centralized_logs_group" {
+  provider = aws.centralized_account
+  name     = "/aws/kinesisfirehose/CentralizedLogs"
+}
+
+resource "aws_kinesis_stream" "centralized_log_stream" {
+  provider         = aws.centralized_account
+  name             = "centralized-log-stream"
+  shard_count      = 1
+  retention_period = 24
+
+  tags = {
+    Environment = "production"
+  }
+}
+
+resource "aws_iam_role" "source_account_access" {
+  provider = aws.centralized_account
+  name     = "SourceAccountKinesisAccess"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::637423594986:root"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "kinesis_access" {
+  provider = aws.centralized_account
+  name     = "KinesisAccessPolicy"
+  role     = aws_iam_role.source_account_access.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "kinesis:PutRecord",
+          "kinesis:PutRecords"
+        ]
+        Resource = aws_kinesis_stream.centralized_log_stream.arn
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_resource_policy" "firehose_policy" {
+  provider     = aws.centralized_account
+  policy_name  = "CentralizedFirehoseLogPolicy"
+
+  policy_document = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect    = "Allow",
+        Principal = { "AWS": "637423594986" },
+        Action    = [
+          "logs:PutLogEvents",
+          "logs:CreateLogStream",
+          "logs:DescribeLogStreams"
+        ],
+        Resource  = "arn:aws:logs:${var.region}:590183916327:log-group:/aws/kinesisfirehose/CentralizedLogs:*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "firehose_role_centralized" {
+  provider = aws.centralized_account
+  name     = "CentralizedFirehoseRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect    = "Allow",
+        Principal = { Service = "firehose.amazonaws.com" },
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "firehose_policy_centralized" {
+  provider = aws.centralized_account
+  role     = aws_iam_role.firehose_role_centralized.name
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:PutObject",
+          "s3:GetBucketLocation",
+          "s3:ListBucket",
+          "s3:PutObjectAcl"
+        ],
+        Resource = "arn:aws:s3:::testeks12*"
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "logs:PutLogEvents",
+          "logs:CreateLogStream",
+          "logs:DescribeLogStreams"
+        ],
+        Resource = "arn:aws:logs:${var.region}:590183916327:log-group:/aws/kinesisfirehose/CentralizedLogs:*"
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "kinesis:DescribeStream"
+        ],
+        Resource = aws_kinesis_stream.centralized_log_stream.arn
+      }
+    ]
+  })
+}
+
+resource "aws_s3_bucket" "logs_bucket" {
+  provider = aws.centralized_account
+  bucket   = "testeks12-${var.unique_identifier}"
+}
+
+resource "aws_s3_bucket_versioning" "logs_bucket_versioning" {
+  provider = aws.centralized_account
+  bucket   = aws_s3_bucket.logs_bucket.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_iam_role" "source_account_role" {
+  provider = aws.source_account
+  name     = "SourceAccountRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect    = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::590183916327:root"
+        },
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "source_account_policy" {
+  provider = aws.source_account
+  role     = aws_iam_role.source_account_role.name
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect   = "Allow",
+        Action   = "s3:PutObject",
+        Resource = "arn:aws:s3:::testeks12-${var.unique_identifier}/*"
+      }
+    ]
+  })
+}
+
+resource "aws_s3_bucket_policy" "logs_bucket_policy" {
+  provider = aws.centralized_account
+  bucket   = aws_s3_bucket.logs_bucket.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect    = "Allow",
+        Principal = {
+          AWS = "arn:aws:iam::637423594986:role/SourceAccountRole"
+        },
+        Action    = "s3:PutObject",
+        Resource  = "${aws_s3_bucket.logs_bucket.arn}/*"
+      }
+    ]
+  })
+}
+
+resource "aws_kinesis_firehose_delivery_stream" "firehose_stream" {
+  provider    = aws.centralized_account
+  name        = "CentralizedFirehoseStream"
+  destination = "extended_s3"
+
+  extended_s3_configuration {
+    role_arn           = aws_iam_role.firehose_role_centralized.arn
+    bucket_arn         = aws_s3_bucket.logs_bucket.arn
+    buffering_size     = 5
+    buffering_interval = 300
+
+    cloudwatch_logging_options {
+      enabled         = true
+      log_group_name  = "/aws/kinesisfirehose/CentralizedLogs"
+      log_stream_name = "FromSourceAccount"
+    }
+  }
+
+  kinesis_source_configuration {
+    kinesis_stream_arn = aws_kinesis_stream.centralized_log_stream.arn
+    role_arn           = aws_iam_role.firehose_role_centralized.arn
+  }
+}
+
+resource "aws_iam_role" "lambda_execution_role" {
+  provider = aws.centralized_account
+  name     = "CentralizedLambdaExecutionRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect    = "Allow",
+        Principal = { Service = "lambda.amazonaws.com" },
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "lambda_policy" {
+  provider = aws.centralized_account
+  name     = "LambdaS3AndCloudWatchPolicy"
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          "arn:aws:s3:::testeks12",
+          "arn:aws:s3:::testeks12/*"
+        ]
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        Resource = "arn:aws:logs:${var.region}:590183916327:log-group:/aws/kinesisfirehose/CentralizedLogs:*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_policy_attachment" {
+  provider   = aws.centralized_account
+  role       = aws_iam_role.lambda_execution_role.name
+  policy_arn = aws_iam_policy.lambda_policy.arn
+}
+
+resource "aws_lambda_function" "process_s3_logs" {
+  provider      = aws.centralized_account
+  function_name = "ProcessS3Logs"
+  runtime       = "python3.9"
+  handler       = "lambda_function.lambda_handler"
+  role          = aws_iam_role.lambda_execution_role.arn
+
+  filename         = "lambda_function.zip"
+  source_code_hash = filebase64sha256("lambda_function.zip")
+}
+
+resource "time_sleep" "wait_for_lambda" {
+  create_duration = "30s"
+  depends_on      = [aws_lambda_function.process_s3_logs]
+}
+
+resource "aws_s3_bucket_notification" "s3_bucket_notification" {
+  provider = aws.centralized_account
+  bucket   = aws_s3_bucket.logs_bucket.id
+
+  depends_on = [time_sleep.wait_for_lambda]
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.process_s3_logs.arn
+    events              = ["s3:ObjectCreated:*"]
+  }
+}
+
+resource "aws_lambda_permission" "allow_s3" {
+  provider      = aws.centralized_account
+  statement_id  = "AllowExecutionFromS3"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.process_s3_logs.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.logs_bucket.arn
+}
